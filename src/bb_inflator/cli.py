@@ -1,3 +1,4 @@
+import glob
 import logging
 import os
 import shutil
@@ -221,7 +222,7 @@ def inflate_from_kustomization(kustomization_dir):
     "kustomization_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True)
 )
 def extract_values_from_kustomization(kustomization_dir):
-    """Run kustomize build on a kustomization dir and merge values.yaml from ConfigMaps in HelmRelease.valuesFrom order."""
+    """Run kustomize build on a kustomization dir and merge values.yaml from ConfigMaps and Secrets in HelmRelease.valuesFrom order, decrypting SOPS-encrypted values inline."""
     try:
         logging.debug(f"Running kustomize build in {kustomization_dir}")
         result = subprocess.run(
@@ -234,7 +235,7 @@ def extract_values_from_kustomization(kustomization_dir):
             sys.exit(result.returncode)
         # Parse the multi-document YAML output
         logging.debug(
-            "Parsing kustomize build output for ConfigMaps and HelmRelease..."
+            "Parsing kustomize build output for ConfigMaps, Secrets, and HelmRelease..."
         )
         docs = list(yaml.safe_load_all(result.stdout))
         # Find all ConfigMaps with values.yaml
@@ -248,6 +249,37 @@ def extract_values_from_kustomization(kustomization_dir):
                 name = doc.get("metadata", {}).get("name", "<no-name>")
                 configmaps[name] = doc["data"]["values.yaml"]
                 logging.debug(f"Found ConfigMap: {name}")
+        # Recursively find and decrypt all secrets.enc.yaml files
+        secret_files = find_secrets_files_recursive(kustomization_dir)
+        logging.debug(f"Found secrets.enc.yaml files: {secret_files}")
+        secrets = {}
+        for secret_file in secret_files:
+            try:
+                logging.debug(f"Decrypting {secret_file} with sops...")
+                sops_result = subprocess.run(
+                    ["sops", "-d", secret_file],
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(secret_file),
+                )
+                if sops_result.returncode != 0:
+                    logging.warning(
+                        f"Failed to decrypt {secret_file}: {sops_result.stderr}"
+                    )
+                    continue
+                secret_docs = list(yaml.safe_load_all(sops_result.stdout))
+                for doc in secret_docs:
+                    if (
+                        isinstance(doc, dict)
+                        and doc.get("kind") == "Secret"
+                        and "values.yaml" in doc.get("stringData", {})
+                    ):
+                        name = doc.get("metadata", {}).get("name", "<no-name>")
+                        secrets[name] = doc["stringData"]["values.yaml"]
+                        logging.debug(f"Found Secret: {name}")
+            except Exception as e:
+                logging.warning(f"Error processing {secret_file}: {e}")
+                continue
         # Find HelmRelease and its valuesFrom order
         helmrelease = None
         for doc in docs:
@@ -265,22 +297,48 @@ def extract_values_from_kustomization(kustomization_dir):
             sys.exit(1)
         values_from = helmrelease.get("spec", {}).get("valuesFrom", [])
         logging.debug(f"HelmRelease valuesFrom: {values_from}")
-        # Merge values.yaml from ConfigMaps in order
+        # Merge values.yaml from ConfigMaps and Secrets in order
         merged_values = {}
         for entry in values_from:
-            if entry.get("kind") == "ConfigMap":
-                cm_name = entry.get("name")
-                if cm_name in configmaps:
-                    values_yaml = configmaps[cm_name]
-                    logging.debug(f"Merging values from ConfigMap: {cm_name}")
+            kind = entry.get("kind")
+            name = entry.get("name")
+            if kind == "ConfigMap" and name in configmaps:
+                values_yaml = configmaps[name]
+                logging.debug(f"Merging values from ConfigMap: {name}")
+                values_data = yaml.safe_load(values_yaml)
+                if values_data:
+                    merged_values = deep_merge(merged_values, values_data)
+            elif kind == "Secret":
+                # Try exact match first
+                values_yaml = secrets.get(name)
+                matched_secret = name
+                # If not found, try prefix match
+                if values_yaml is None:
+                    for base_name, secret_val in secrets.items():
+                        if name.startswith(base_name):
+                            values_yaml = secret_val
+                            matched_secret = base_name
+                            logging.debug(f"Prefix match: {name} -> {base_name}")
+                            break
+                if values_yaml:
+                    logging.debug(
+                        f"Merging values from Secret: {matched_secret} (for {name})"
+                    )
                     values_data = yaml.safe_load(values_yaml)
                     if values_data:
                         merged_values = deep_merge(merged_values, values_data)
         if not merged_values:
             console.print(
-                "[red]No values.yaml data found in referenced ConfigMaps.[/red]"
+                "[red]No values.yaml data found in referenced ConfigMaps or Secrets.[/red]"
             )
             sys.exit(1)
+
+        def str_presenter(dumper, data):
+            if "\n" in data:
+                return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+            return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+        yaml.add_representer(str, str_presenter)
         yaml_output = yaml.dump(merged_values, sort_keys=False)
         yaml_output = yaml_output.replace("\n\n", "\n")
         syntax = Syntax(yaml_output, "yaml", theme="monokai", line_numbers=False)
@@ -288,6 +346,34 @@ def extract_values_from_kustomization(kustomization_dir):
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
+
+
+def find_secrets_files_recursive(start_dir):
+    """Recursively find all secrets.enc.yaml files in start_dir and its bases."""
+    found = set()
+    stack = [os.path.abspath(start_dir)]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        # Find secrets.enc.yaml in this dir
+        for file in glob.glob(os.path.join(current, "secrets.enc.yaml")):
+            found.add(os.path.abspath(file))
+        # Recurse into local bases
+        kustom_file = os.path.join(current, "kustomization.yaml")
+        if not os.path.exists(kustom_file):
+            kustom_file = os.path.join(current, "kustomization.yml")
+        if not os.path.exists(kustom_file):
+            continue
+        with open(kustom_file, "r") as f:
+            kustom = yaml.safe_load(f)
+        for base in kustom.get("bases", []):
+            if not base.startswith("git::"):
+                base_path = os.path.normpath(os.path.join(current, base))
+                stack.append(base_path)
+    return list(found)
 
 
 def deep_merge(a, b):
@@ -301,6 +387,56 @@ def deep_merge(a, b):
         else:
             result[k] = v
     return result
+
+
+@cli.command()
+@click.argument(
+    "kustomization_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True)
+)
+def print_secret_values(kustomization_dir):
+    """Print all decrypted values.yaml from secrets.enc.yaml files."""
+    try:
+        secret_files = find_secrets_files_recursive(kustomization_dir)
+        logging.debug(f"Found secrets.enc.yaml files: {secret_files}")
+        found = False
+        for secret_file in secret_files:
+            try:
+                logging.debug(f"Decrypting {secret_file} with sops...")
+                sops_result = subprocess.run(
+                    ["sops", "-d", os.path.basename(secret_file)],
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(secret_file),
+                )
+                if sops_result.returncode != 0:
+                    logging.warning(
+                        f"Failed to decrypt {secret_file}: {sops_result.stderr}"
+                    )
+                    continue
+                secret_docs = list(yaml.safe_load_all(sops_result.stdout))
+                for doc in secret_docs:
+                    if (
+                        isinstance(doc, dict)
+                        and doc.get("kind") == "Secret"
+                        and "values.yaml" in doc.get("stringData", {})
+                    ):
+                        name = doc.get("metadata", {}).get("name", "<no-name>")
+                        values_yaml = doc["stringData"]["values.yaml"]
+                        console.print(f"[bold green]Secret: {name}[/bold green]")
+                        syntax = Syntax(
+                            values_yaml, "yaml", theme="monokai", line_numbers=False
+                        )
+                        console.print(syntax)
+                        found = True
+            except Exception as e:
+                logging.warning(f"Error processing {secret_file}: {e}")
+                continue
+        if not found:
+            console.print("[red]No decrypted values.yaml found in any secrets.[/red]")
+            sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
