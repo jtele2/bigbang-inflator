@@ -1,5 +1,14 @@
 # 🛠️ Usage
 
+## ⚡ TL;DR
+
+Most common usage:
+
+```sh
+# Replace "istio-controlplane" with any package you want to see manifests for...
+./scripts/get-manifests.sh --kustomize-directory <dir> --name istio-controlplane
+```
+
 ## Prerequisites ⚙️
 
 - [kustomize](https://kubectl.docs.kubernetes.io/installation/kustomize/)
