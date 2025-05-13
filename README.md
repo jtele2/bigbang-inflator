@@ -1,47 +1,65 @@
-## CLI Usage
+# 🛠️ Usage
 
-This project provides a CLI tool to work with BigBang Helm chart manifests.
+## Prerequisites ⚙️
 
-### Extract `values.yaml` from a ConfigMap manifest
+- [kustomize](https://kubectl.docs.kubernetes.io/installation/kustomize/)
+- [sops](https://github.com/mozilla/sops)
+- [yq](https://github.com/mikefarah/yq)
+- [helm](https://helm.sh/)
+- [git](https://git-scm.com/)
 
-You can extract the `values.yaml` key from a Kubernetes ConfigMap manifest and output it as YAML:
+## Scripts 📂
 
-```sh
-cat manifest.yaml | python -m bb_inflator.cli extract-values
-```
+### 1. `build-bb-manifest.sh` 🚀
 
-Or from a file:
+Extracts and builds manifests from a BigBang kustomization directory, decodes secrets, merges values, clones the BigBang repo, and generates Helm manifests.
 
-```sh
-python -m bb_inflator.cli extract-values --input manifest.yaml
-```
-
-The output will be syntax-highlighted YAML, suitable for piping into `yq` or saving to a file.
-
-### Inflate BigBang manifests from a Git repo
-
-Clone a BigBang repo at a specific ref and render all manifests using kustomize:
+**Usage:**
 
 ```sh
-python -m bb_inflator.cli inflate --repo-url https://repo1.dso.mil/big-bang/bigbang.git --ref 2.52.0 --subdir base
+./scripts/build-bb-manifest.sh <kustomize_directory>
 ```
 
-- `--repo-url`: The Git repository to clone (required)
-- `--ref`: The branch, tag, or commit to checkout (required)
-- `--subdir`: Subdirectory within the repo to run kustomize build (optional, default is repo root)
+- `<kustomize_directory>`: Path to the directory containing your `kustomization.yaml`.
 
-The output will be all rendered manifests, suitable for further processing with `yq` or saving to a file.
+**Outputs:**
 
-### Inflate from a kustomization directory
+- `./generated/manifest.yaml`
+- `./generated/values.yaml`
+- `./generated/bigbang-manifests.yaml`
 
-You can also inflate manifests by pointing the CLI at a kustomization directory. The CLI will parse the base git repo and ref from the kustomization.yaml and inflate accordingly:
+---
+
+### 2. `get-manifests.sh` 📦
+
+Fetches and builds manifests for a specific BigBang component by name, or lists available component names.
+
+**Usage:**
 
 ```sh
-python -m bb_inflator.cli inflate-from-kustomization <path-to-kustomization-dir>
+./scripts/get-manifests.sh --kustomize-directory <dir> --name <component-name>
 ```
 
-This will automatically:
-- Parse the `bases` entry in your `kustomization.yaml` for the git repo and ref
-- Clone the repo and checkout the correct ref
-- Run `kustomize build` on the correct subdirectory
-- Output all manifests to stdout
+- `--kustomize-directory <dir>`: Path to the kustomize directory (**required**).
+- `--name <component-name>`: Name of the component to fetch (**required** unless using `--list-names`).
+- `--list-names`: List available component names.
+
+**Examples:**
+
+- List available component names:
+
+  ```sh
+  ./scripts/get-manifests.sh --kustomize-directory <dir> --list-names
+  ```
+
+- Get manifests for a specific component:
+
+  ```sh
+  ./scripts/get-manifests.sh --kustomize-directory <dir> --name istio-controlplane
+  ```
+
+**Outputs:**
+
+- `./generated/<component-name>-manifests.yaml`
+
+---
