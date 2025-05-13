@@ -1,10 +1,12 @@
 import glob
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import click
@@ -434,6 +436,184 @@ def print_secret_values(kustomization_dir):
         if not found:
             console.print("[red]No decrypted values.yaml found in any secrets.[/red]")
             sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument(
+    "kustomization_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True)
+)
+def helm_template_with_values(kustomization_dir):
+    """Render Helm chart from Git repo using merged values.yaml from kustomization."""
+    import io
+    import shutil
+    import tempfile
+
+    logging.debug(f"Extracting merged values.yaml from {kustomization_dir}")
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            extract_values_from_kustomization.callback(kustomization_dir)
+        merged_values_yaml = buf.getvalue()
+        print("==== Merged values.yaml to be written ====")
+        print(merged_values_yaml)
+        print("==========================================")
+        # Sanitize: remove control characters except newlines and tabs
+        merged_values_yaml = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", merged_values_yaml)
+        logging.debug(f"Sanitized merged values.yaml:\n{merged_values_yaml}")
+    except Exception as e:
+        console.print(f"[red]Failed to extract merged values.yaml: {e}[/red]")
+        sys.exit(1)
+    # Parse base repo/ref/subdir
+    try:
+        repo_url, ref, subdir = parse_kustomization_for_git_info(kustomization_dir)
+        logging.debug(f"Parsed base repo: {repo_url}, ref: {ref}, subdir: {subdir}")
+    except Exception as e:
+        console.print(f"[red]Failed to parse base repo info: {e}[/red]")
+        sys.exit(1)
+    # Clone the repo
+    if git is None:
+        console.print(
+            "[red]GitPython is required for this command. Install with: uv add gitpython[/red]"
+        )
+        sys.exit(1)
+    temp_repo_dir = tempfile.mkdtemp(prefix="bb-inflator-repo-")
+    temp_values_file = tempfile.NamedTemporaryFile("w+", delete=False, suffix=".yaml")
+    try:
+        console.print(f"[green]Cloning {repo_url}@{ref}...[/green]")
+        repo = git.Repo.clone_from(repo_url, temp_repo_dir)
+        repo.git.checkout(ref)
+        chart_path = os.path.join(temp_repo_dir, subdir) if subdir else temp_repo_dir
+        logging.debug(f"Chart path for helm template: {chart_path}")
+        # Write merged values.yaml to temp file
+        temp_values_file.write(merged_values_yaml)
+        temp_values_file.flush()
+        # Run helm template
+        console.print("[green]Running helm template...[/green]")
+        result = subprocess.run(
+            ["helm", "template", "bigbang", chart_path, "-f", temp_values_file.name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]helm template failed:[/red]\n{result.stderr}")
+            sys.exit(result.returncode)
+        console.print(result.stdout)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+    finally:
+        shutil.rmtree(temp_repo_dir)
+        temp_values_file.close()
+        try:
+            os.unlink(temp_values_file.name)
+        except Exception:
+            pass
+
+
+def copy_and_rewrite_kustomization(src_dir, dest_dir, base_path_map, repo_local_base):
+    """Recursively copy kustomization dir and all local bases, rewriting bases to local paths."""
+    import os
+    import shutil
+
+    import yaml
+
+    os.makedirs(dest_dir, exist_ok=True)
+    kustom_file = os.path.join(src_dir, "kustomization.yaml")
+    if not os.path.exists(kustom_file):
+        kustom_file = os.path.join(src_dir, "kustomization.yml")
+    if not os.path.exists(kustom_file):
+        raise FileNotFoundError(
+            f"No kustomization.yaml or kustomization.yml found in {src_dir}"
+        )
+    with open(kustom_file, "r") as f:
+        kustom = yaml.safe_load(f)
+    new_bases = []
+    for base in kustom.get("bases", []):
+        if base.startswith("git::"):
+            new_bases.append(repo_local_base)
+            logging.debug(f"Replaced git:: base {base} with {repo_local_base}")
+        elif not base.startswith("git::"):
+            # Local base: copy recursively
+            abs_base = os.path.normpath(os.path.join(src_dir, base))
+            rel_base = os.path.relpath(abs_base, start=base_path_map["root_src"])
+            dest_base = os.path.join(base_path_map["root_dest"], rel_base)
+            copy_and_rewrite_kustomization(
+                abs_base, dest_base, base_path_map, repo_local_base
+            )
+            new_bases.append(rel_base)
+            logging.debug(
+                f"Rewrote local base {base} to {rel_base} and copied to {dest_base}"
+            )
+    kustom["bases"] = new_bases
+    # Copy all files except kustomization.yaml/yml
+    for item in os.listdir(src_dir):
+        s = os.path.join(src_dir, item)
+        d = os.path.join(dest_dir, item)
+        if os.path.isdir(s):
+            if item not in [".git", "__pycache__"]:
+                shutil.copytree(s, d, dirs_exist_ok=True)
+        elif not item.startswith("kustomization.yaml") and not item.startswith(
+            "kustomization.yml"
+        ):
+            shutil.copy2(s, d)
+    # Write the rewritten kustomization.yaml
+    with open(os.path.join(dest_dir, "kustomization.yaml"), "w") as f:
+        yaml.dump(kustom, f, sort_keys=False)
+
+
+@cli.command()
+@click.argument(
+    "kustomization_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True)
+)
+def kustomize_build_with_local_base(kustomization_dir):
+    """Recursively copy all local bases and the base repo to the current directory, rewrite all bases to local paths, and run kustomize build in the cwd."""
+    import os
+    import shutil
+    import sys
+
+    logging.debug(f"Parsing base repo/ref/subdir from {kustomization_dir}")
+    try:
+        repo_url, ref, subdir = parse_kustomization_for_git_info(kustomization_dir)
+        logging.debug(f"Parsed base repo: {repo_url}, ref: {ref}, subdir: {subdir}")
+    except Exception as e:
+        console.print(f"[red]Failed to parse base repo info: {e}[/red]")
+        sys.exit(1)
+    if git is None:
+        console.print(
+            "[red]GitPython is required for this command. Install with: uv add gitpython[/red]"
+        )
+        sys.exit(1)
+    repo_local_base = os.path.abspath("cloned-bigbang-base")
+    try:
+        # Clone the repo to cwd/cloned-bigbang-base
+        if os.path.exists(repo_local_base):
+            shutil.rmtree(repo_local_base)
+        console.print(
+            f"[green]Cloning {repo_url}@{ref} to {repo_local_base}...[/green]"
+        )
+        repo = git.Repo.clone_from(repo_url, repo_local_base)
+        repo.git.checkout(ref)
+        if subdir:
+            repo_local_base = os.path.join(repo_local_base, subdir)
+        # Recursively copy and rewrite all local bases to cwd
+        root_src = os.path.abspath(kustomization_dir)
+        root_dest = os.path.abspath(os.getcwd())
+        base_path_map = {"root_src": root_src, "root_dest": root_dest}
+        copy_and_rewrite_kustomization(
+            root_src, root_dest, base_path_map, repo_local_base
+        )
+        # Run kustomize build in cwd
+        console.print(f"[green]Running kustomize build in {root_dest}...[/green]")
+        result = subprocess.run(
+            ["kustomize", "build", root_dest], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            console.print(f"[red]kustomize build failed:[/red]\n{result.stderr}")
+            sys.exit(result.returncode)
+        console.print(result.stdout)
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
